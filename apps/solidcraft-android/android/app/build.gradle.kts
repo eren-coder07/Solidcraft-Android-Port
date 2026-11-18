@@ -63,11 +63,25 @@ android {
         }
     }
 
+    // A release keystore handed in through the environment (the CI release workflow sets these):
+    // SOLIDCRAFT_RELEASE_KEYSTORE is the keystore file, with the store password, key alias and key
+    // password beside it. Without one, the debug key signs, as before (an installable test build).
+    val releaseKeystore: File? = System.getenv("SOLIDCRAFT_RELEASE_KEYSTORE")?.takeIf { File(it).isFile }
+    if (releaseKeystore != null) {
+        signingConfigs.create("releaseEnv") {
+            storeFile = releaseKeystore
+            storePassword = System.getenv("SOLIDCRAFT_RELEASE_STORE_PASSWORD") ?: ""
+            keyAlias = System.getenv("SOLIDCRAFT_RELEASE_KEY_ALIAS") ?: "solidcraft"
+            keyPassword = System.getenv("SOLIDCRAFT_RELEASE_KEY_PASSWORD") ?: System.getenv("SOLIDCRAFT_RELEASE_STORE_PASSWORD") ?: ""
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Signed with the debug key until the project has a release key.
-            signingConfig = signingConfigs.getByName("debug")
+            // Signed with the CI's release key when the environment provides one; the debug key
+            // until then (local builds stay unsigned-with-debug, as the port has always done).
+            signingConfig = if (releaseKeystore != null) signingConfigs.getByName("releaseEnv") else signingConfigs.getByName("debug")
         }
     }
 }

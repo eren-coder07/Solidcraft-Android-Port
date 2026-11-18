@@ -1,0 +1,203 @@
+# SolidCraft for Android — universal (32-bit + 64-bit) release build.
+#
+# Builds on GitHub's runners instead of a laptop: the Gradle project in
+# apps/solidcraft-android/android drives cargo-ndk, which builds
+# libsolidcraft_android.so for each requested ABI (armv7-linux-androideabi for
+# armeabi-v7a — the 32-bit ABI upstream's release script never shipped — plus
+# aarch64-linux-android for arm64-v8a and x86_64-linux-android for Intel
+# Googlebooks), then packages one APK per choice and a universal APK carrying
+# both ARM ABIs.
+#
+#   Dispatch with portRevision = 2 → version 0.42.0b (SolidCraft 0.42.0, port
+#   revision b), tag v0.42.0b-android-32bit, and four APKs:
+#     SolidCraft-0.42.0b-android-universal-arm32-arm64.apk  (phones, tablets, every real device)
+#     SolidCraft-0.42.0b-android-arm64.apk                  (phones, tablets, Arm Googlebooks)
+#     SolidCraft-0.42.0b-android-arm32.apk                  (old 32-bit phones, armeabi-v7a)
+#     SolidCraft-0.42.0b-android-x86_64.apk                 (Intel Googlebooks, emulators)
+#
+# Release signing: ANDROID_KEYSTORE_B64 (a base64 keystore) plus the three
+# SOLIDCRAFT_RELEASE_* passwords as repo secrets; without them the build falls
+# back to the debug key, as the port's local builds always have.
+
+name: android-release-32bit
+
+on:
+  workflow_dispatch:
+    inputs:
+      portRevision:
+        description: 'Port revision: 0 (none) or 1..26 (becomes a..z after the version)'
+        required: false
+        default: '2'
+      createRelease:
+        description: 'Publish a GitHub release with the APKs'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: android-release-32bit
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space (drop preinstalled SDK/NDK parts we replace, dotnet, ghc)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf "$ANDROID_HOME/ndk"/* || true
+          df -h /
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK (NDK 29.0.14206865, platform 36, build-tools 36)
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: 'true'
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Decode the release keystore
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_B64" ]; then
+            KEYSTORE="$RUNNER_TEMP/solidcraft-release.jks"
+            printf '%s' "$ANDROID_KEYSTORE_B64" | base64 -d > "$KEYSTORE"
+            {
+              echo "SOLIDCRAFT_RELEASE_KEYSTORE=$KEYSTORE"
+              echo "SOLIDCRAFT_RELEASE_STORE_PASSWORD=${{ secrets.SOLIDCRAFT_RELEASE_STORE_PASSWORD }}"
+              echo "SOLIDCRAFT_RELEASE_KEY_ALIAS=${{ secrets.SOLIDCRAFT_RELEASE_KEY_ALIAS }}"
+              echo "SOLIDCRAFT_RELEASE_KEY_PASSWORD=${{ secrets.SOLIDCRAFT_RELEASE_KEY_PASSWORD }}"
+            } >> "$GITHUB_ENV"
+            echo "release signing: SOLIDCRAFT_RELEASE_KEYSTORE"
+          else
+            echo "release signing: debug key (no ANDROID_KEYSTORE_B64 secret)"
+          fi
+
+      - name: Version and tag
+        id: version
+        run: |
+          ver=$(sed -n 's/^version = "\([0-9.]*\)".*/\1/p' Cargo.toml | head -1)
+          rev=${{ inputs.portRevision }}
+          letter=""
+          if [ "$rev" -gt 0 ]; then letter=$(printf "\\$(printf '%03o' $((96 + rev)))"); fi
+          name="$ver$letter"
+          tag="v$name-android-32bit"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "SolidCraft $name, tag $tag"
+
+      - name: Build the universal APK (arm64-v8a + armeabi-v7a)
+        run: |
+          cd apps/solidcraft-android/android
+          ./gradlew -q assembleRelease -Psolidcraft.abis=arm64-v8a,armeabi-v7a -Psolidcraft.portRevision=${{ inputs.portRevision }}
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp app/build/outputs/apk/release/SolidCraft-${{ steps.version.outputs.name }}-release.apk \
+            "$GITHUB_WORKSPACE/dist/SolidCraft-${{ steps.version.outputs.name }}-android-universal-arm32-arm64.apk"
+
+      - name: Build the arm64 APK (phones, tablets, Arm Googlebooks)
+        run: |
+          cd apps/solidcraft-android/android
+          ./gradlew -q assembleRelease -Psolidcraft.abis=arm64-v8a -Psolidcraft.portRevision=${{ inputs.portRevision }}
+          cp app/build/outputs/apk/release/SolidCraft-${{ steps.version.outputs.name }}-release.apk \
+            "$GITHUB_WORKSPACE/dist/SolidCraft-${{ steps.version.outputs.name }}-android-arm64.apk"
+
+      - name: Build the 32-bit APK (armeabi-v7a)
+        run: |
+          cd apps/solidcraft-android/android
+          ./gradlew -q assembleRelease -Psolidcraft.abis=armeabi-v7a -Psolidcraft.portRevision=${{ inputs.portRevision }}
+          cp app/build/outputs/apk/release/SolidCraft-${{ steps.version.outputs.name }}-release.apk \
+            "$GITHUB_WORKSPACE/dist/SolidCraft-${{ steps.version.outputs.name }}-android-arm32.apk"
+
+      - name: Build the x86_64 APK (Intel Googlebooks)
+        run: |
+          cd apps/solidcraft-android/android
+          ./gradlew -q assembleRelease -Psolidcraft.abis=x86_64 -Psolidcraft.portRevision=${{ inputs.portRevision }}
+          cp app/build/outputs/apk/release/SolidCraft-${{ steps.version.outputs.name }}-release.apk \
+            "$GITHUB_WORKSPACE/dist/SolidCraft-${{ steps.version.outputs.name }}-android-x86_64.apk"
+
+      - name: Checksums
+        run: (cd dist && sha256sum * > SHA256SUMS.txt) && ls -la dist/
+
+      - name: Release notes
+        run: |
+          name="${{ steps.version.outputs.name }}"
+          tag="${{ steps.version.outputs.tag }}"
+          cat > dist/notes.md <<EOF
+          SolidCraft $name for Android and Googlebook OS — **now with a 32-bit build**.
+
+          Built from [deveshrai/Solidcraft-Android-Port](https://github.com/deveshrai/Solidcraft-Android-Port) at \`main\` (upstream SolidCraft 0.42.0 plus the Android port) with 32-bit support added on top: the release previously shipped arm64-v8a and x86_64 only, so old 32-bit phones could not run it. This release adds **armeabi-v7a**.
+
+          **Install:** on a phone or tablet, download \`SolidCraft-$name-android-universal-arm32-arm64.apk\` — it carries both ARM libraries, so it installs on every real device, 32-bit or 64-bit. Per-ABI APKs are there too (\`-arm64\`, \`-arm32\`, \`-x86_64\`), if you want the smaller download. Open the file, allowing installs from that source, or \`adb install -r\` it. Signed with a release key: uninstall a build installed from elsewhere first if Android refuses to update it.
+
+          **Works:** the full SolidCraft app (sketches, features, the timeline, the Render workspace) on Vulkan or GLES; mouse and keyboard as on the desktop; touch (one finger orbits, tap selects, two fingers pan, pinch zooms); Back closes what is open; open, save, import and export through Android's file picker (STEP, STL, 3MF and OBJ); the on-screen keyboard; Samsung DeX and Googlebook OS windows; the MCP server on the network for AI agents (Settings › MCP server). See the port's [usage guide](https://github.com/deveshrai/Solidcraft-Android-Port/blob/main/docs/android-touch.md) and [what works](https://github.com/deveshrai/Solidcraft-Android-Port/blob/main/docs/android.md).
+
+          **32-bit note:** the WASM plugin runtime is aarch64/x86_64 only upstream, so plugin loading is disabled in the 32-bit library (the app itself is unaffected). The 32-bit library also runs in a ~3 GB address space, so very large models may not fit.
+
+          SHA-256 checksums are in \`SHA256SUMS.txt\`.
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apks
+          path: dist/*
+
+      - name: Publish the GitHub release
+        if: ${{ inputs.createRelease == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" dist/* \
+            --title "SolidCraft ${{ steps.version.outputs.name }} for Android — universal, 32-bit + 64-bit" \
+            --notes-file dist/notes.md --latest
+
+  pages:
+    if: ${{ inputs.createRelease == 'true' }}
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download page
+        run: |
+          name="${GITHUB_REF_NAME}"
+          mkdir -p site
+          cat > site/index.html <<EOF
+          <!doctype html>
+          <html lang="en"><head><meta charset="utf-8"><title>SolidCraft for Android — downloads</title>
+          <style>body{font-family:system-ui,sans-serif;max-width:640px;margin:4rem auto;padding:0 1rem;color:#222}
+          h1{font-size:1.6rem}li{margin:.6rem 0}code{background:#f2f2f2;padding:.1rem .3rem}</style></head>
+          <body><h1>SolidCraft for Android — downloads</h1>
+          <p>Universal APK with 32-bit (armeabi-v7a) and 64-bit (arm64-v8a) support, plus per-ABI builds.</p>
+          <ul>
+          <li><a href="https://github.com/eren-coder07/Solidcraft-Android-Port/releases/latest">Latest release — universal APK (32-bit + 64-bit), per-ABI APKs and checksums</a></li>
+          <li><a href="https://github.com/eren-coder07/Solidcraft-Android-Port/releases">All releases</a></li>
+          </ul>
+          <p>Built from <a href="https://github.com/deveshrai/Solidcraft-Android-Port">deveshrai/Solidcraft-Android-Port</a>.</p>
+          </body></html>
+          EOF
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - uses: actions/deploy-pages@v4
