@@ -66,7 +66,7 @@ android {
     // A release keystore handed in through the environment (the CI release workflow sets these):
     // SOLIDCRAFT_RELEASE_KEYSTORE is the keystore file, with the store password, key alias and key
     // password beside it. Without one, the debug key signs, as before (an installable test build).
-    val releaseKeystore: File? = System.getenv("SOLIDCRAFT_RELEASE_KEYSTORE")?.takeIf { File(it).isFile }
+    val releaseKeystore: File? = System.getenv("SOLIDCRAFT_RELEASE_KEYSTORE")?.takeIf { File(it).isFile }?.let { File(it) }
     if (releaseKeystore != null) {
         signingConfigs.create("releaseEnv") {
             storeFile = releaseKeystore
